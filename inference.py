@@ -79,6 +79,7 @@ if __name__ == '__main__':
     connection = pika.BlockingConnection(pika.ConnectionParameters(host='49.234.229.39', port='5672'))
     channel = connection.channel()
     channel.queue_declare(queue='q_wav')
+    channel.queue_declare(queue='q_video')
 
     def callback(ch, method, properties, body):
         global msgId
@@ -156,7 +157,7 @@ if __name__ == '__main__':
         if not os.path.exists(opt.res_video_dir):
             os.mkdir(opt.res_video_dir)
         
-        res_video_path = os.path.join(opt.res_video_dir,os.path.basename(opt.source_video_path)[:-4] + f'_{msgId}_video.mp4')
+        res_video_path = os.path.join(opt.res_video_dir, os.path.basename(opt.source_video_path)[:-4] + f'_{msgId}_video.mp4')
         if os.path.exists(res_video_path):
             os.remove(res_video_path)
         videowriter = cv2.VideoWriter(res_video_path, cv2.VideoWriter_fourcc(*'XVID'), 25, video_size)
@@ -218,6 +219,12 @@ if __name__ == '__main__':
         print('时间开销(秒):', time.time() - time_stamp)
         print('总的帧率: ', (pad_length - 5) / (time.time() - time_stamp))
         subprocess.call(cmd, shell=True)
+        
+        # 发送消息
+        print(os.path.basename(video_add_audio_path))
+        filename = f"/home/ubuntu/code/DINet/asserts/inference_result/{os.path.basename(video_add_audio_path)}"
+        channel.basic_publish(exchange='', routing_key='q_video', body=filename)
+        
         # 删除 res_video_path
         os.remove(res_video_path)
 

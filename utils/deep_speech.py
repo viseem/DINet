@@ -17,6 +17,7 @@ class DeepSpeech():
         self.graph, self.logits_ph, self.input_node_ph, self.input_lengths_ph \
             = self._prepare_deepspeech_net(model_path)
         self.target_sample_rate = 16000
+        self.sess = tf.compat.v1.Session(graph=self.graph, config=tf.compat.v1.ConfigProto(device_count={'GPU': 1}));
 
     def _prepare_deepspeech_net(self,deepspeech_pb_path):
         print("===>Loading model from file %s" % deepspeech_pb_path)
@@ -90,25 +91,25 @@ class DeepSpeech():
 
         time_stamp = time.time()
         tf.config.optimizer.set_jit(True)
-        with tf.compat.v1.Session(graph=self.graph, config=tf.compat.v1.ConfigProto(device_count={'GPU': 1})) as sess:
-            print('初始化 seesion 的时间(秒):', time.time() - time_stamp)
-            time_stamp = time.time()
-            
-            input_vector = self.conv_audio_to_deepspeech_input_vector(
-                audio=resampled_audio.astype(np.int16),
-                sample_rate=self.target_sample_rate,
-                num_cepstrum=26,
-                num_context=9)
-            
-            print('conv_audio_to_deepspeech_input_vector 的时间(秒):', time.time() - time_stamp)
-            time_stamp = time.time()
-            network_output = sess.run(
-                    self.logits_ph,
-                    feed_dict={
-                        self.input_node_ph: input_vector[np.newaxis, ...],
-                        self.input_lengths_ph: [input_vector.shape[0]]})
-            print('sess.run 的时间(秒):', time.time() - time_stamp)
-            ds_features = network_output[::2,0,:]
+        # with tf.compat.v1.Session(graph=self.graph, config=tf.compat.v1.ConfigProto(device_count={'GPU': 1})) as sess:
+        print('初始化 seesion 的时间(秒):', time.time() - time_stamp)
+        time_stamp = time.time()
+        
+        input_vector = self.conv_audio_to_deepspeech_input_vector(
+            audio=resampled_audio.astype(np.int16),
+            sample_rate=self.target_sample_rate,
+            num_cepstrum=26,
+            num_context=9)
+        
+        print('conv_audio_to_deepspeech_input_vector 的时间(秒):', time.time() - time_stamp)
+        time_stamp = time.time()
+        network_output = self.sess.run(
+                self.logits_ph,
+                feed_dict={
+                    self.input_node_ph: input_vector[np.newaxis, ...],
+                    self.input_lengths_ph: [input_vector.shape[0]]})
+        print('sess.run 的时间(秒):', time.time() - time_stamp)
+        ds_features = network_output[::2,0,:]
         return ds_features
 
 if __name__ == '__main__':
