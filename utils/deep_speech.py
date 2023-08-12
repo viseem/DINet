@@ -7,10 +7,6 @@ from scipy.io import wavfile
 from python_speech_features import mfcc
 import tensorflow as tf
 
-# tf.compat.v1.disable_v2_behavior()
-# tf.compat.v1.reset_default_graph()
-# tf.config.threading.set_inter_op_parallelism_threads(1)
-# tf.config.threading.set_intra_op_parallelism_threads(1)
 
 class DeepSpeech():
     def __init__(self,model_path):
@@ -71,6 +67,30 @@ class DeepSpeech():
 
         return train_inputs
 
+    def compute_raw_wav_feature(self, wav_data):
+        time_stamp = time.time()
+        if wav_data.ndim != 1:
+            warnings.warn(
+                "Audio has multiple channels, the first channel is used")
+            wav_data = wav_data[:, 0]
+
+        input_vector = self.conv_audio_to_deepspeech_input_vector(
+            audio=wav_data.astype(np.int16),
+            sample_rate=self.target_sample_rate,
+            num_cepstrum=26,
+            num_context=9)
+        
+        print('conv_audio_to_deepspeech_input_vector 的时间(秒):', time.time() - time_stamp)
+        time_stamp = time.time()
+        network_output = self.sess.run(
+                self.logits_ph,
+                feed_dict={
+                    self.input_node_ph: input_vector[np.newaxis, ...],
+                    self.input_lengths_ph: [input_vector.shape[0]]})
+        print('sess.run 的时间(秒):', time.time() - time_stamp)
+        ds_features = network_output[::2,0,:]
+        return ds_features
+    
     def compute_audio_feature(self,audio_path):
         time_stamp = time.time()
         audio_sample_rate, audio = wavfile.read(audio_path)
@@ -81,20 +101,15 @@ class DeepSpeech():
             audio = audio[:, 0]
         if audio_sample_rate != self.target_sample_rate:
             resampled_audio = resampy.resample(
-                x=audio.astype(np.float),
+                x=audio.astype(np.float64),
                 sr_orig=audio_sample_rate,
                 sr_new=self.target_sample_rate)
         else:
-            resampled_audio = audio.astype(np.float)
+            resampled_audio = audio.astype(np.float64)
         
-        print('读取音频的时间(秒):', time.time() - time_stamp)
+        print('wavfile.read 时间(秒):', time.time() - time_stamp)
 
         time_stamp = time.time()
-        tf.config.optimizer.set_jit(True)
-        # with tf.compat.v1.Session(graph=self.graph, config=tf.compat.v1.ConfigProto(device_count={'GPU': 1})) as sess:
-        print('初始化 seesion 的时间(秒):', time.time() - time_stamp)
-        time_stamp = time.time()
-        
         input_vector = self.conv_audio_to_deepspeech_input_vector(
             audio=resampled_audio.astype(np.int16),
             sample_rate=self.target_sample_rate,
@@ -113,8 +128,20 @@ class DeepSpeech():
         return ds_features
 
 if __name__ == '__main__':
-    audio_path = r'./00168.wav'
-    model_path = r'./output_graph.pb'
+    audio_path = r'../asserts/examples/driving_audio_3.wav'
+    model_path = r'../asserts/output_graph.pb'
     DSModel = DeepSpeech(model_path)
+    time_stamp = time.time()
     ds_feature = DSModel.compute_audio_feature(audio_path)
-    print(ds_feature)
+    # sleep 3s
+    time.sleep(3)
+    ds_feature = DSModel.compute_audio_feature(audio_path)
+    time.sleep(3)
+    ds_feature = DSModel.compute_audio_feature(r'../asserts/examples/1s.wav')
+    time.sleep(3)
+    ds_feature = DSModel.compute_audio_feature(audio_path)
+    time.sleep(3)
+    ds_feature = DSModel.compute_audio_feature(r'/tmp/tmptz3ewf1z.wav')
+    time.sleep(3)
+    ds_feature = DSModel.compute_audio_feature(r'/tmp/tmptz3ewf1z.wav')
+    print('初始化 seesion 的时间(秒):', time.time() - time_stamp)

@@ -3,7 +3,9 @@ from utils.deep_speech import DeepSpeech
 from utils.data_processing import load_landmark_openface,compute_crop_radius
 from config.config import DINetInferenceOptions
 from models.DINet import DINet
-
+from scipy.io import wavfile
+import threading
+import queue
 import numpy as np
 import glob
 import os
@@ -12,11 +14,22 @@ import cv2
 import torch
 import subprocess
 import random
+import nls
 from collections import OrderedDict
 
   
 # 定义rabitmq的链接
 channel = None
+
+# 音频处理设置信息
+data_queue = queue.Queue()
+URL= "wss://nls-gateway-cn-beijing.aliyuncs.com/ws/v1"
+TOKEN= "fb3f966388324e2189f553919a782e07"
+APPKEY="FCW8uluerIsGU24l"
+sample_rate = 16000
+bytes_per_sample = 2  # 16-bit PCM
+data_buffer = np.array([])
+file_count = 0
 
 
 def extract_frames_from_video(video_path,save_dir):
@@ -34,7 +47,6 @@ def extract_frames_from_video(video_path,save_dir):
     return (int(frame_width),int(frame_height))
 
 if __name__ == '__main__':
-    msgId = 0
 
     # load config
     opt = DINetInferenceOptions().parse_args()
@@ -71,31 +83,14 @@ if __name__ == '__main__':
         raise ('pls download pretrained model of deepspeech')
     DSModel = DeepSpeech(opt.deepspeech_model_path)
 
-    ############################################## 开始推理  开始推理  开始推理  开始推理 ##############################################
-    ############################################## 开始推理  开始推理  开始推理  开始推理 ##############################################
-    ############################################## 开始推理  开始推理  开始推理  开始推理 ##############################################
-
-    ############################################## 监听队列消息 ##############################################
-    connection = pika.BlockingConnection(pika.ConnectionParameters(host='49.234.229.39', port='5672'))
-    channel = connection.channel()
-    channel.queue_declare(queue='q_wav')
-    channel.queue_declare(queue='q_video')
-
-    def callback(ch, method, properties, body):
-        global msgId
-        msgId += 1
-        opt.driving_audio_path = body.decode('utf-8')
-        ############################################## extract deep speech feature from driving_audio_path ##############################################
+    ############################################## 核心推理函数 ##############################################
+    def infer_process(wav_data, wav_file, file_count):
+        __start_time = time.time()
         # 获取当前的时间戳，按照毫秒
-        print('extracting deepspeech feature from : {}'.format(opt.driving_audio_path))
         time_stamp = time.time()
-        
-        if not os.path.exists(opt.driving_audio_path):
-            raise ('wrong audio path :{}'.format(opt.driving_audio_path))
-        ds_feature = DSModel.compute_audio_feature(opt.driving_audio_path)
+        ds_feature = DSModel.compute_raw_wav_feature(wav_data)
         res_frame_length = ds_feature.shape[0]
         ds_feature_padding = np.pad(ds_feature, ((2, 2), (0, 0)), mode='edge')
-        print('声音特征分析(秒):', time.time() - time_stamp)
         
         ############################################## align frame with driving audio ##############################################
         print('aligning frames with driving audio')
@@ -157,7 +152,7 @@ if __name__ == '__main__':
         if not os.path.exists(opt.res_video_dir):
             os.mkdir(opt.res_video_dir)
         
-        res_video_path = os.path.join(opt.res_video_dir, os.path.basename(opt.source_video_path)[:-4] + f'_{msgId}_video.mp4')
+        res_video_path = os.path.join(opt.res_video_dir, os.path.basename(opt.source_video_path)[:-4] + f'_{file_count}_video.mp4')
         if os.path.exists(res_video_path):
             os.remove(res_video_path)
         videowriter = cv2.VideoWriter(res_video_path, cv2.VideoWriter_fourcc(*'XVID'), 25, video_size)
@@ -212,7 +207,7 @@ if __name__ == '__main__':
             os.remove(video_add_audio_path)
         cmd = 'ffmpeg -i {} -i {} -c:v copy -c:a aac -strict experimental -map 0:v:0 -map 1:a:0 {}'.format(
             res_video_path,
-            opt.driving_audio_path,
+            wav_file,
             video_add_audio_path)
         
         print('一共推理图片: ', pad_length - 5)
@@ -220,15 +215,89 @@ if __name__ == '__main__':
         print('总的帧率: ', (pad_length - 5) / (time.time() - time_stamp))
         subprocess.call(cmd, shell=True)
         
-        # 发送消息
-        print(os.path.basename(video_add_audio_path))
-        filename = f"/home/ubuntu/code/DINet/asserts/inference_result/{os.path.basename(video_add_audio_path)}"
-        channel.basic_publish(exchange='', routing_key='q_video', body=filename)
-        
         # 删除 res_video_path
         os.remove(res_video_path)
+        os.remove(wav_file)
+        
+        end_time = time.time()
+        # 计算程序的总耗时
+        print("总耗时: ", end_time - __start_time)
 
-    channel.basic_consume(queue='q_wav', on_message_callback=callback, auto_ack=True)
+    ############################################## TTS 核心逻辑 ##############################################
+    def save_wav(filename, data):
+        wavfile.write(filename, sample_rate, data.astype(np.int16))
+
+    def tts_on_error(message, *args):
+        print("on_error args=>{}".format(args))
+
+    def tts_on_close(*args):
+        print("on_close: args=>{}".format(args))
+
+    def tts_on_completed(message, *args):
+        global data_buffer
+        if data_buffer:
+            data_queue.put(data_buffer)  # put any remaining data in the queue
+            data_buffer.clear()
+        print("on_completed:args=>{} message=>{}".format(args, message))
+
+    def tts_on_data(data):
+        global data_buffer
+        current_data = np.frombuffer(data, dtype=np.int16)
+        data_buffer = np.concatenate((data_buffer, current_data))
+        
+        while len(data_buffer) >= sample_rate:  # 1 second of audio data
+            data_queue.put(data_buffer[:sample_rate])  # put the data in the queue
+            data_buffer = data_buffer[sample_rate:]
+
+    def process_data():
+        connection = pika.BlockingConnection(pika.ConnectionParameters(host='49.234.229.39', port='5672'))
+        q_video_channel = connection.channel()
+        q_video_channel.queue_declare(queue='q_video')
+        
+        global file_count
+        while True:
+            data = data_queue.get(block=True, timeout=None)
+            if data is None:  # sentinel value to exit the loop
+                continue
+            wav_file = "ali_tts_part_{}.wav".format(file_count)
+            save_wav(wav_file, data)
+            infer_process(data, wav_file, file_count) # 推理
+
+            # 发送消息
+            filename = f"/home/ubuntu/code/DINet/asserts/inference_result/cofi_{file_count}.mp4"
+            q_video_channel.basic_publish(exchange='', routing_key='q_video', body=filename)
+            file_count += 1
+
+    tts = nls.NlsSpeechSynthesizer(
+        url=URL,
+        token=TOKEN,
+        appkey=APPKEY,
+        on_data=tts_on_data,
+        on_completed=tts_on_completed,
+        on_error=tts_on_error,
+        on_close=tts_on_close)
+    ############################################## 开始推理  开始推理  开始推理  开始推理 ##############################################
+
+    ############################################## 监听队列消息 ##############################################
+    connection = pika.BlockingConnection(pika.ConnectionParameters(host='49.234.229.39', port='5672'))
+    channel = connection.channel()
+    channel.queue_declare(queue='q_tts')
+
+    # 接收 gpt 文本，进行 tts 语音合成
+    def tts_cb(ch, method, properties, body, test_str = None):
+        gpt_text = body.decode('utf-8') if body is not None else None
+        print(" [x] 开始处理文字： %r" % gpt_text)
+        if gpt_text is not None:
+            tts.start(gpt_text, voice="ailun", aformat="wav", sample_rate=16000)
+
+
+    # callback(1, 2, 3, 4, opt.driving_audio_path)
+    # callback(1, 2, 3, 4, "utils/tmptz3ewf1z.wav")
+
+    data_thread = threading.Thread(target=process_data)
+    data_thread.start()
+
+    channel.basic_consume(queue='q_tts', on_message_callback=tts_cb, auto_ack=True)
     channel.start_consuming()
 
    
