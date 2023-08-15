@@ -24,7 +24,7 @@ channel = None
 # 音频处理设置信息
 data_queue = queue.Queue()
 URL= "wss://nls-gateway-cn-beijing.aliyuncs.com/ws/v1"
-TOKEN= "fb3f966388324e2189f553919a782e07"
+TOKEN= "46aa510185644fb3a725ea05c9eff4a6"
 APPKEY="FCW8uluerIsGU24l"
 sample_rate = 16000
 bytes_per_sample = 2  # 16-bit PCM
@@ -82,6 +82,8 @@ if __name__ == '__main__':
     if not os.path.exists(opt.deepspeech_model_path):
         raise ('pls download pretrained model of deepspeech')
     DSModel = DeepSpeech(opt.deepspeech_model_path)
+    DSModel.compute_audio_feature(opt.driving_audio_path)
+    ref_img_tensor = torch.load("five_selected_ref_img.pt")
 
     ############################################## 核心推理函数 ##############################################
     def infer_process(wav_data, wav_file, file_count):
@@ -113,7 +115,7 @@ if __name__ == '__main__':
             res_video_landmark_data = np.concatenate([video_landmark_data_cycle]* divisor + [video_landmark_data_cycle[:remainder, :, :]],0)
         res_video_frame_path_list_pad = [video_frame_path_list_cycle[0]] * 2 \
                                         + res_video_frame_path_list \
-                                        + [video_frame_path_list_cycle[-1]] * 2
+                                        + [video_frame_path_list_cycle[-1]] * 2 
         res_video_landmark_data_pad = np.pad(res_video_landmark_data, ((2, 2), (0, 0), (0, 0)), mode='edge')
         assert ds_feature_padding.shape[0] == len(res_video_frame_path_list_pad) == res_video_landmark_data_pad.shape[0]
         pad_length = ds_feature_padding.shape[0]
@@ -122,27 +124,28 @@ if __name__ == '__main__':
         ############################################## randomly select 5 reference images ##############################################
         print('selecting five reference images')
         time_stamp = time.time()
-
-        ref_img_list = []
+        
+        # ref_img_list = []
         resize_w = int(opt.mouth_region_size + opt.mouth_region_size // 4)
         resize_h = int((opt.mouth_region_size // 2) * 3 + opt.mouth_region_size // 8)
-        ref_index_list = random.sample(range(5, len(res_video_frame_path_list_pad) - 2), 5)
-        for ref_index in ref_index_list:
-            crop_flag,crop_radius = compute_crop_radius(video_size,res_video_landmark_data_pad[ref_index - 5:ref_index, :, :])
-            if not crop_flag:
-                raise ('our method can not handle videos with large change of facial size!!')
-            crop_radius_1_4 = crop_radius // 4
-            ref_img = cv2.imread(res_video_frame_path_list_pad[ref_index- 3])[:, :, ::-1]
-            ref_landmark = res_video_landmark_data_pad[ref_index - 3, :, :]
-            ref_img_crop = ref_img[
-                    ref_landmark[29, 1] - crop_radius:ref_landmark[29, 1] + crop_radius * 2 + crop_radius_1_4,
-                    ref_landmark[33, 0] - crop_radius - crop_radius_1_4:ref_landmark[33, 0] + crop_radius +crop_radius_1_4,
-                    :]
-            ref_img_crop = cv2.resize(ref_img_crop,(resize_w,resize_h))
-            ref_img_crop = ref_img_crop / 255.0
-            ref_img_list.append(ref_img_crop)
-        ref_video_frame = np.concatenate(ref_img_list, 2)
-        ref_img_tensor = torch.from_numpy(ref_video_frame).permute(2, 0, 1).unsqueeze(0).float().cuda()
+        # ref_index_list = random.sample(range(5, len(res_video_frame_path_list_pad) - 2), 5)
+        # for ref_index in ref_index_list:
+        #     crop_flag,crop_radius = compute_crop_radius(video_size,res_video_landmark_data_pad[ref_index - 5:ref_index, :, :])
+        #     if not crop_flag:
+        #         raise ('our method can not handle videos with large change of facial size!!')
+        #     crop_radius_1_4 = crop_radius // 4
+        #     ref_img = cv2.imread(res_video_frame_path_list_pad[ref_index- 3])[:, :, ::-1]
+        #     ref_landmark = res_video_landmark_data_pad[ref_index - 3, :, :]
+        #     ref_img_crop = ref_img[
+        #             ref_landmark[29, 1] - crop_radius:ref_landmark[29, 1] + crop_radius * 2 + crop_radius_1_4,
+        #             ref_landmark[33, 0] - crop_radius - crop_radius_1_4:ref_landmark[33, 0] + crop_radius +crop_radius_1_4,
+        #             :]
+        #     ref_img_crop = cv2.resize(ref_img_crop,(resize_w,resize_h))
+        #     ref_img_crop = ref_img_crop / 255.0
+        #     ref_img_list.append(ref_img_crop)
+        # ref_video_frame = np.concatenate(ref_img_list, 2)
+        # ref_img_tensor = torch.from_numpy(ref_video_frame).permute(2, 0, 1).unsqueeze(0).float().cuda()
+        # torch.save(ref_img_tensor, "five_selected_ref_img.pt")
 
         print('随机选择5个图片的时间开销(秒):', time.time() - time_stamp)
 
@@ -152,7 +155,7 @@ if __name__ == '__main__':
         if not os.path.exists(opt.res_video_dir):
             os.mkdir(opt.res_video_dir)
         
-        res_video_path = os.path.join(opt.res_video_dir, os.path.basename(opt.source_video_path)[:-4] + f'_{file_count}_video.mp4')
+        res_video_path = os.path.join(opt.res_video_dir, os.path.basename(opt.source_video_path)[:-4] + f'_{file_count}.mp4')
         if os.path.exists(res_video_path):
             os.remove(res_video_path)
         videowriter = cv2.VideoWriter(res_video_path, cv2.VideoWriter_fourcc(*'XVID'), 25, video_size)
@@ -202,22 +205,26 @@ if __name__ == '__main__':
         videowriter.release()
         # videowriter_face.release()
 
-        video_add_audio_path = res_video_path.replace('_video.mp4', '.mp4')
-        if os.path.exists(video_add_audio_path):
-            os.remove(video_add_audio_path)
-        cmd = 'ffmpeg -i {} -i {} -c:v copy -c:a aac -strict experimental -map 0:v:0 -map 1:a:0 {}'.format(
-            res_video_path,
-            wav_file,
-            video_add_audio_path)
+        # video_add_audio_path = res_video_path.replace('_video.mp4', '.mp4')
+        # if os.path.exists(video_add_audio_path):
+        #     os.remove(video_add_audio_path)
+        # cmd = 'ffmpeg -i {} -i {} -c:v copy -c:a aac -strict experimental -map 0:v:0 -map 1:a:0 {}'.format(
+        #     res_video_path,
+        #     wav_file,
+        #     video_add_audio_path)
         
         print('一共推理图片: ', pad_length - 5)
         print('时间开销(秒):', time.time() - time_stamp)
         print('总的帧率: ', (pad_length - 5) / (time.time() - time_stamp))
-        subprocess.call(cmd, shell=True)
+
+        # 计算下面的耗时
+        # ffmepg_start_time = time.time()
+        # subprocess.call(cmd, shell=True)
+        # print('ffmepg_start_time  合成耗时: ', time.time() - ffmepg_start_time)
         
         # 删除 res_video_path
-        os.remove(res_video_path)
-        os.remove(wav_file)
+        # os.remove(res_video_path)
+        # os.remove(wav_file)
         
         end_time = time.time()
         # 计算程序的总耗时
@@ -259,12 +266,12 @@ if __name__ == '__main__':
             data = data_queue.get(block=True, timeout=None)
             if data is None:  # sentinel value to exit the loop
                 continue
-            wav_file = "ali_tts_part_{}.wav".format(file_count)
+            wav_file = "/home/ubuntu/code/DINet/asserts/inference_result/cofi_{}.wav".format(file_count)
             save_wav(wav_file, data)
             infer_process(data, wav_file, file_count) # 推理
 
             # 发送消息
-            filename = f"/home/ubuntu/code/DINet/asserts/inference_result/cofi_{file_count}.mp4"
+            filename = f"/home/ubuntu/code/DINet/asserts/inference_result/cofi_{file_count}"
             q_video_channel.basic_publish(exchange='', routing_key='q_video', body=filename)
             file_count += 1
 
