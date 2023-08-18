@@ -50,7 +50,7 @@ channel = None
 data_queue = queue.Queue()
 URL= "wss://nls-gateway-cn-beijing.aliyuncs.com/ws/v1"
 TOKEN= "89253ea12c624e78a0ccd3453d4799e9"
-APPKEY="FCW8uluerIsGU24l"
+APPKEY="igPUfsogsueKTmi2"
 sample_rate = 16000
 bytes_per_sample = 2  # 16-bit PCM
 data_buffer = np.array([])
@@ -240,6 +240,8 @@ class PlayListTrack(MediaStreamTrack):
 
             if self.kind == 'audio':
                 finished, data = next(media_frame_holder.audio_holder)
+                if(data is None):
+                    raise Exception('data is None') 
                 data.pts = int(self._time * 48000)
                 self._time += 0.02
                 result = data
@@ -252,6 +254,8 @@ class PlayListTrack(MediaStreamTrack):
             else:
                 finished, data = next(media_frame_holder.video_holder)
                 data.pts = int(self._time / data.time_base)
+                if(data is None):
+                    raise Exception('data is None') 
                 self._time += 0.04
                 result = data
                 if finished:
@@ -666,7 +670,7 @@ if __name__ == '__main__':
         
         print(" [x] 开始处理文字： %r" % tts_data['text'])
         if gpt_text is not None:
-            tts.start(tts_data['text'], voice="ailun", aformat="wav", sample_rate=16000)
+            tts.start(tts_data['text'], voice="zhiyuan", aformat="wav", sample_rate=16000)
 
     # 启动socket服务 
     def run_asyncio_ws():
