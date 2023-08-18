@@ -609,9 +609,9 @@ if __name__ == '__main__':
     def tts_on_completed(message, *args):
         user_id = args[0]
         global data_buffer
-        if data_buffer:
-            data_queue.put({'rawdata': data_buffer, 'user_id': user_id})  # put any remaining data in the queue
-            data_buffer.clear()
+        if len(data_buffer) > 0:
+            data_queue.put({'rawdata': data_buffer[:sample_rate], 'user_id': user_id})  # put any remaining data in the queue
+            data_buffer = data_buffer[sample_rate:]
 
     def tts_on_data(data, *args):
         user_id = args[0]
@@ -620,7 +620,6 @@ if __name__ == '__main__':
         data_buffer = np.concatenate((data_buffer, current_data))
         
         while len(data_buffer) >= sample_rate:  # 1 second of audio data
-            print("put data in queue")
             data_queue.put({'rawdata': data_buffer[:sample_rate], 'user_id': user_id})  # put the data in the queue
             data_buffer = data_buffer[sample_rate:]
 
@@ -635,7 +634,10 @@ if __name__ == '__main__':
             infer_process(data['rawdata'], wav_file, mp4_file) # 推理
 
             # 选择对的 player jump in 数据
-            players[data['user_id']].jump_in(jump_file)
+            try:
+                players[data['user_id']].jump_in(jump_file)
+            except print(0):
+                pass
             file_count += 1
 
     
