@@ -19,4 +19,12 @@ ttskit==0.3.8
 pyttsx4==3.0.15
 websockets==11.0.3
 opencv-python==4.8.0.74
+aiortc==1.5.0
+aiohttp==3.8.4
+av==10.0.0
+requests
+websockets
+rel==0.4.9
 pika
+chardet==5.2.0
+cchardet==2.1.7

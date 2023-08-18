@@ -16,7 +16,32 @@ import subprocess
 import random
 import nls
 from collections import OrderedDict
+import asyncio
+import json
+import logging
+import os
+import ssl
+import threading
+import time
+import traceback
+import websockets
+import pika
+import uuid
+from queue import Queue, Empty
+from typing import Union
 
+import aiortc
+import av
+import requests
+from aiohttp import web
+from aiortc import MediaStreamTrack, RTCSessionDescription, RTCPeerConnection, RTCRtpSender, RTCConfiguration, RTCIceServer
+from aiortc.mediastreams import MediaStreamError
+from av.frame import Frame
+from av.packet import Packet
+from pyee.asyncio import AsyncIOEventEmitter
+
+# 文件的 user_id 与 count 的分割
+FILE_NAME_SPLIT = "#"
   
 # 定义rabitmq的链接
 channel = None
@@ -24,13 +49,21 @@ channel = None
 # 音频处理设置信息
 data_queue = queue.Queue()
 URL= "wss://nls-gateway-cn-beijing.aliyuncs.com/ws/v1"
-TOKEN= "46aa510185644fb3a725ea05c9eff4a6"
+TOKEN= "89253ea12c624e78a0ccd3453d4799e9"
 APPKEY="FCW8uluerIsGU24l"
 sample_rate = 16000
 bytes_per_sample = 2  # 16-bit PCM
 data_buffer = np.array([])
 file_count = 0
 
+# webrtc 信息
+players = {}
+pcs = set()
+playlist = [
+    "asserts/examples/base.mp4",
+]
+
+############################################## webrtc start ##############################################
 
 def extract_frames_from_video(video_path,save_dir):
     videoCapture = cv2.VideoCapture(video_path)
@@ -45,6 +78,341 @@ def extract_frames_from_video(video_path,save_dir):
         result_path = os.path.join(save_dir, str(i).zfill(6) + '.jpg')
         cv2.imwrite(result_path, frame)
     return (int(frame_width),int(frame_height))
+
+
+class MediaFrameHolder:
+    def __init__(self, url: str) -> None:
+        if (url == "asserts/examples/base.mp4"):
+            self.audio_holder = FrameHolder('audio', url)
+            self.video_holder = FrameHolder('video', url)
+        else: 
+            self.audio_holder = FrameHolder('audio', url + '.wav')
+            self.video_holder = FrameHolder('video', url + '.mp4')
+
+
+class FrameHolder:
+    def __init__(self, kind, url: str) -> None:
+        self._kind = kind
+        # 视频url
+        self._url = url
+        self._is_net_file = url.startswith("http")
+        # 如果是http的视频，先缓存到本地。否则av打开网上的视频，很久不读之后会有问题，造成画面卡死
+        if self._is_net_file:
+            self.local_filename = "video_temp/" + os.path.basename(url)
+            # 如果目录不存在，就创建目录
+            if not os.path.exists(os.path.dirname(self.local_filename)):
+                os.makedirs(os.path.dirname(self.local_filename))
+            # 发送 GET 请求获取视频二进制数据
+            response = self._retry_get(url, 3)
+            # 将二进制数据写入本地文件
+            with open(self.local_filename, "wb") as f:
+                f.write(response.content)
+            self._container = av.open(self.local_filename)
+        else:
+            self._container = av.open(url)
+        self.buf = []
+        self.last_frame = None
+        self._sampler = av.AudioResampler(
+            format="s16",
+            layout="stereo",
+            rate=48000,
+            frame_size=int(48000 * 0.02),
+        )
+
+    def _retry_get(self, url: str, count: int):
+        for _ in range(count):
+            try:
+                return requests.get(url, timeout=(1, 3))
+            except Exception:
+                traceback.print_stack()
+                logging.error("get video error: %s, %d", url, count)
+
+    def clear(self):
+        def close_resources():
+            self._container.close()
+            if self._is_net_file:
+                os.remove(self.local_filename)
+
+        try:
+            close_resources()
+        except Exception:
+            traceback.print_stack()
+            logging.warning("remove %s failed, try remove again 5s later", self.local_filename)
+            timer = threading.Timer(5, close_resources)
+            timer.start()  # 启动定时器
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        try:
+            if self._kind == 'audio':
+                audio_stream = self._container.streams.audio[0]
+                frame = next(self._container.decode(audio_stream))
+                for re_frame in self._sampler.resample(frame):
+                    self.buf.append(re_frame)
+            else:
+                video_stream = self._container.streams.video[0]
+                frame = next(self._container.decode(video_stream))
+                self.buf.append(frame)
+        except Exception:
+            pass
+        try:
+            # Remove and return item at index (default last). fuck！！！
+            f = self.buf.pop(0)
+            self.last_frame = f
+            return False, self.last_frame
+        except Exception:
+            self._container.close()
+            return True, self.last_frame
+
+
+class Sentinel:
+    def __init__(self, player) -> None:
+        self._player = player
+        # 记录播放列表的游标
+        self._play_list_cursor = 0
+        self._thread = None
+        self._sig_stop = False
+
+    def start(self):
+        if self._thread is None:
+            self._thread = threading.Thread(
+                name='sentinel',
+                target=self.maintain_push_queue,
+                args=()
+            )
+            self._thread.start()
+
+    def stop(self):
+        self._sig_stop = True
+
+    def next_video(self):
+        # # 有插播就先选择插播
+        # jump_in_list = self._player.jump_in_list
+        # jump_in = None
+        # try:
+        #     jump_in = jump_in_list.get_nowait()
+        # except Empty:
+        #     pass
+        # if jump_in:
+        #     return jump_in
+
+        # 没有插播的话要拿到当前播放的下一个
+        play_list = self._player.playlist
+        idx = self._play_list_cursor % len(play_list)
+        url = play_list[idx]
+        self._play_list_cursor += 1
+        return url
+
+    def maintain_push_queue(self):
+        push_queue = self._player.push_queue
+        while True:
+            if self._sig_stop:
+                break
+            url = self.next_video()
+            push_queue.put(MediaFrameHolder(url))
+            print("successfully put to push_queue", url)
+
+
+class PlayListTrack(MediaStreamTrack):
+    def __init__(self, player, kind):
+        super().__init__()
+        self.kind = kind
+        self._player = player
+        self._queue = asyncio.Queue()
+        self._start = None
+        self._time = 0.
+        self.fps = 25
+
+    async def recv(self) -> Union[Frame, Packet]:
+        if self.readyState != "live":
+            raise MediaStreamError
+        while self._player.push_queue.empty():
+            await asyncio.sleep(0.01)
+        from_jump_in = False
+        if not self._player.push_queue.empty() or not self._player.jump_in_list.empty():
+            if not self._player.jump_in_list.empty():
+                media_frame_holder = self._player.jump_in_list.queue[0]
+                from_jump_in = True
+            else:
+                media_frame_holder = self._player.push_queue.queue[0]
+
+            if self.kind == 'audio':
+                finished, data = next(media_frame_holder.audio_holder)
+                data.pts = int(self._time * 48000)
+                self._time += 0.02
+                result = data
+                if finished:
+                    if not from_jump_in:
+                        self._player.push_queue.get_nowait()
+                    else:
+                        self._player.jump_in_list.get_nowait()
+                    media_frame_holder.video_holder.clear()
+            else:
+                finished, data = next(media_frame_holder.video_holder)
+                data.pts = int(self._time / data.time_base)
+                self._time += 0.04
+                result = data
+                if finished:
+                    if not from_jump_in:
+                        self._player.push_queue.get_nowait()
+                    else:
+                        self._player.jump_in_list.get_nowait()
+                    media_frame_holder.audio_holder.clear()
+        else:
+            raise Exception('result is None')
+        if result is None:
+            raise Exception('result is None')
+        data_time = float(result.pts * result.time_base)
+
+        if self._start is None:
+            self._start = time.time() - data_time
+        else:
+            wait = self._start + data_time - time.time()
+            await asyncio.sleep(wait)
+
+        return result
+
+    def pause(self):
+        pass
+
+    def resume(self):
+        pass
+
+    def stop(self):
+        super().stop()
+        self._queue.empty()
+
+
+class SegmentPlayer:
+    def __init__(self, playlist: []) -> None:
+        super().__init__()
+        self.__audio = PlayListTrack(self, 'audio')
+        self.__video = PlayListTrack(self, 'video')
+        self.__loop = asyncio.get_event_loop()
+        self.__thread = None
+        self.__stop = False
+        self.__sentinel = None
+        # 循环播放队列
+        self.__playlist = playlist
+        # 插播队列
+        self.jump_in_list = Queue()
+        # 等待推送队里了
+        self.push_queue = Queue(maxsize=1)
+        self.last_jumpin_tiem = time.time()
+
+    @property
+    def is_stopped(self):
+        return self.__stop
+
+    @property
+    def playlist(self) -> []:
+        return self.__playlist
+
+
+    @property
+    def audio(self) -> PlayListTrack:
+        """
+        A :class:`aiortc.MediaStreamTrack` instance if the file contains audio.
+        """
+        return self.__audio
+
+    @property
+    def video(self) -> PlayListTrack:
+        """
+        A :class:`aiortc.MediaStreamTrack` instance if the file contains video.
+        """
+        return self.__video
+
+    # 开始
+    def start(self):
+        if self.__sentinel is None:
+            self.__sentinel = Sentinel(self)
+            self.__sentinel.start()
+
+    # 停止
+    def stop(self):
+        self.__stop = True
+        self.audio.stop()
+        self.video.stop()
+        self.__sentinel.stop()
+
+    def jump_in(self, url):
+        self.jump_in_list.put(MediaFrameHolder(url))
+        # 计算上次插播时间
+        current_time = time.time()
+        print("jump duration:", current_time - self.last_jumpin_tiem)
+        self.last_jumpin_tiem = current_time
+
+
+async def on_message(ws, message):
+    json_message = json.loads(message)
+    sdp = json_message["sdp"]
+    type = json_message["type"]
+    client_id = json_message["client_id"]
+
+    conn_id = client_id
+    offer = RTCSessionDescription(sdp=sdp, type=type)
+    pc = RTCPeerConnection(configuration=RTCConfiguration(
+        iceServers=[
+            RTCIceServer('turn:stun.viseem.com:3478', username='test', credential='123456'),
+            RTCIceServer('stun:stun.viseem.com:3478'),
+
+        ])
+    )
+    pcs.add(pc)
+
+    player = SegmentPlayer(playlist=playlist)
+    print("[###] user {} connected.".format(conn_id))
+    players[conn_id] = player
+
+    @pc.on("connectionstatechange")
+    async def on_connectionstatechange():
+        print("Connection state is %s" % pc.connectionState)
+        if pc.connectionState == "failed":
+            await pc.close()
+            pcs.discard(pc)
+            player.stop()
+
+    @pc.on("iceconnectionstatechange")
+    async def on_iceconnectionstatechante():
+        logging.info("ice connection stat change: %s", pc.iceConnectionState)
+        if pc.iceConnectionState == "failed":
+            await pc.close()
+            pcs.discard(pc)
+            player.stop()
+
+    sender = pc.addTrack(player.video)
+    pc.addTrack(player.audio)
+
+    aiortc.codecs.h264.MIN_BITRATE = 3000000
+    aiortc.codecs.h264.DEFAULT_BITRATE = 3000000
+    aiortc.codecs.h264.MAX_BITRATE = 4000000
+    codecs = RTCRtpSender.getCapabilities("video").codecs
+    transceiver = next(t for t in pc.getTransceivers() if t.sender == sender)
+    transceiver.setCodecPreferences(
+        [codec for codec in codecs if codec.mimeType == "video/H264"]
+    )
+    
+    await pc.setRemoteDescription(offer)
+    answer = await pc.createAnswer()
+    await pc.setLocalDescription(answer)
+    await ws.send(json.dumps({"sdp": pc.localDescription.sdp, "type": pc.localDescription.type, "id": conn_id}))
+
+    player.start()
+
+async def init_websocket():
+    print("init websocket ok !!!")
+    uri = "wss://cofi-ws.viseem.com?pid=server&client_type=server"
+    async with websockets.connect(uri) as websocket:
+        while True:
+            msg = await websocket.recv()
+            await on_message(websocket, msg)
+            await asyncio.sleep(0.01)
+
+############################################## webrtc end ##############################################
+
 
 if __name__ == '__main__':
 
@@ -86,7 +454,7 @@ if __name__ == '__main__':
     ref_img_tensor = torch.load("five_selected_ref_img.pt")
 
     ############################################## 核心推理函数 ##############################################
-    def infer_process(wav_data, wav_file, file_count):
+    def infer_process(wav_data, wav_file, mp4_file):
         __start_time = time.time()
         # 获取当前的时间戳，按照毫秒
         time_stamp = time.time()
@@ -152,13 +520,12 @@ if __name__ == '__main__':
         ############################################## inference frame by frame ##############################################
         time_stamp = time.time()
 
-        if not os.path.exists(opt.res_video_dir):
-            os.mkdir(opt.res_video_dir)
+        # if not os.path.exists(opt.res_video_dir):
+        #     os.mkdir(opt.res_video_dir)
         
-        res_video_path = os.path.join(opt.res_video_dir, os.path.basename(opt.source_video_path)[:-4] + f'_{file_count}.mp4')
-        if os.path.exists(res_video_path):
-            os.remove(res_video_path)
-        videowriter = cv2.VideoWriter(res_video_path, cv2.VideoWriter_fourcc(*'XVID'), 25, video_size)
+        if os.path.exists(mp4_file):
+            os.remove(mp4_file)
+        videowriter = cv2.VideoWriter(mp4_file, cv2.VideoWriter_fourcc(*'XVID'), 25, video_size)
 
         # res_face_path = res_video_path.replace('_facial_dubbing.mp4', '_synthetic_face.mp4')
         # if os.path.exists(res_face_path):
@@ -214,7 +581,6 @@ if __name__ == '__main__':
         #     video_add_audio_path)
         
         print('一共推理图片: ', pad_length - 5)
-        print('时间开销(秒):', time.time() - time_stamp)
         print('总的帧率: ', (pad_length - 5) / (time.time() - time_stamp))
 
         # 计算下面的耗时
@@ -235,54 +601,44 @@ if __name__ == '__main__':
         wavfile.write(filename, sample_rate, data.astype(np.int16))
 
     def tts_on_error(message, *args):
-        print("on_error args=>{}".format(args))
+        print("on_error args=>{}".format(message))
 
     def tts_on_close(*args):
         print("on_close: args=>{}".format(args))
 
     def tts_on_completed(message, *args):
+        user_id = args[0]
         global data_buffer
         if data_buffer:
-            data_queue.put(data_buffer)  # put any remaining data in the queue
+            data_queue.put({'rawdata': data_buffer, 'user_id': user_id})  # put any remaining data in the queue
             data_buffer.clear()
-        print("on_completed:args=>{} message=>{}".format(args, message))
 
-    def tts_on_data(data):
+    def tts_on_data(data, *args):
+        user_id = args[0]
         global data_buffer
         current_data = np.frombuffer(data, dtype=np.int16)
         data_buffer = np.concatenate((data_buffer, current_data))
         
         while len(data_buffer) >= sample_rate:  # 1 second of audio data
-            data_queue.put(data_buffer[:sample_rate])  # put the data in the queue
+            print("put data in queue")
+            data_queue.put({'rawdata': data_buffer[:sample_rate], 'user_id': user_id})  # put the data in the queue
             data_buffer = data_buffer[sample_rate:]
 
     def process_data():
-        connection = pika.BlockingConnection(pika.ConnectionParameters(host='49.234.229.39', port='5672'))
-        q_video_channel = connection.channel()
-        q_video_channel.queue_declare(queue='q_video')
-        
-        global file_count
+        global file_count, FILE_NAME_SPLIT
         while True:
-            data = data_queue.get(block=True, timeout=None)
-            if data is None:  # sentinel value to exit the loop
-                continue
-            wav_file = "/home/ubuntu/code/DINet/asserts/inference_result/cofi_{}.wav".format(file_count)
-            save_wav(wav_file, data)
-            infer_process(data, wav_file, file_count) # 推理
+            data = data_queue.get()
+            wav_file = "/home/ubuntu/code/DINet/asserts/inference_result/{}{}{}.wav".format(data['user_id'], FILE_NAME_SPLIT, file_count)
+            mp4_file = "/home/ubuntu/code/DINet/asserts/inference_result/{}{}{}.mp4".format(data['user_id'], FILE_NAME_SPLIT, file_count)
+            jump_file = "/home/ubuntu/code/DINet/asserts/inference_result/{}{}{}".format(data['user_id'], FILE_NAME_SPLIT, file_count)
+            save_wav(wav_file, data['rawdata'])
+            infer_process(data['rawdata'], wav_file, mp4_file) # 推理
 
-            # 发送消息
-            filename = f"/home/ubuntu/code/DINet/asserts/inference_result/cofi_{file_count}"
-            q_video_channel.basic_publish(exchange='', routing_key='q_video', body=filename)
+            # 选择对的 player jump in 数据
+            players[data['user_id']].jump_in(jump_file)
             file_count += 1
 
-    tts = nls.NlsSpeechSynthesizer(
-        url=URL,
-        token=TOKEN,
-        appkey=APPKEY,
-        on_data=tts_on_data,
-        on_completed=tts_on_completed,
-        on_error=tts_on_error,
-        on_close=tts_on_close)
+    
     ############################################## 开始推理  开始推理  开始推理  开始推理 ##############################################
 
     ############################################## 监听队列消息 ##############################################
@@ -293,20 +649,39 @@ if __name__ == '__main__':
     # 接收 gpt 文本，进行 tts 语音合成
     def tts_cb(ch, method, properties, body, test_str = None):
         gpt_text = body.decode('utf-8') if body is not None else None
-        print(" [x] 开始处理文字： %r" % gpt_text)
-        if gpt_text is not None:
-            tts.start(gpt_text, voice="ailun", aformat="wav", sample_rate=16000)
+        tts_data = json.loads(body)
+        
+        tts = nls.NlsSpeechSynthesizer(
+            url=URL,
+            token=TOKEN,
+            appkey=APPKEY,
+            on_data=tts_on_data,
+            on_completed=tts_on_completed,
+            on_error=tts_on_error,
+            on_close=tts_on_close,
+            callback_args=[tts_data['user_id']])
 
+        
+        print(" [x] 开始处理文字： %r" % tts_data['text'])
+        if gpt_text is not None:
+            tts.start(tts_data['text'], voice="ailun", aformat="wav", sample_rate=16000)
+
+    # 启动socket服务 
+    def run_asyncio_ws():
+        asyncio.run(init_websocket())
+
+    threading.Thread(target=run_asyncio_ws).start()
 
     # callback(1, 2, 3, 4, opt.driving_audio_path)
     # callback(1, 2, 3, 4, "utils/tmptz3ewf1z.wav")
-
-    data_thread = threading.Thread(target=process_data)
-    data_thread.start()
+    # print(" [*] Waiting for process_data")
+    threading.Thread(target=process_data).start()
+    print(" [*] Waiting for rabbitmq messages.")
 
     channel.basic_consume(queue='q_tts', on_message_callback=tts_cb, auto_ack=True)
     channel.start_consuming()
 
+ 
    
 
 
