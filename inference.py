@@ -49,7 +49,7 @@ channel = None
 # 音频处理设置信息
 data_queue = queue.Queue()
 URL= "wss://nls-gateway-cn-beijing.aliyuncs.com/ws/v1"
-TOKEN= "89253ea12c624e78a0ccd3453d4799e9"
+TOKEN= "978046a73c374b06a3617d6ec654417c"
 APPKEY="igPUfsogsueKTmi2"
 sample_rate = 16000
 bytes_per_sample = 2  # 16-bit PCM
