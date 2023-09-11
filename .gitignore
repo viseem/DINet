@@ -2,3 +2,4 @@ asserts/*
 **/*.pyc
 asserts.zip
 imgs/*
+*.pt

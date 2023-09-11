@@ -49,7 +49,7 @@ channel = None
 # 音频处理设置信息
 data_queue = queue.Queue()
 URL= "wss://nls-gateway-cn-beijing.aliyuncs.com/ws/v1"
-TOKEN= "978046a73c374b06a3617d6ec654417c"
+TOKEN= "a98aabd17b124d3b8fcf09bebe3be98b"
 APPKEY="igPUfsogsueKTmi2"
 sample_rate = 16000
 bytes_per_sample = 2  # 16-bit PCM
@@ -62,6 +62,13 @@ pcs = set()
 playlist = [
     "asserts/examples/base.mp4",
 ]
+playlistDict = {
+    "mm_1": ["asserts/examples/mm_1_base.mp4"],
+    "mm_2": ["asserts/examples/mm_2_base.mp4"],
+}
+characterDict = {} # 链接 connec_id 与 character 的关系
+refImgTensorDict = {} # 链接 character 与 refImgTensor 的关系
+landmarkDict = {} # 链接 character 与 landmark 的关系
 
 ############################################## webrtc start ##############################################
 
@@ -82,7 +89,7 @@ def extract_frames_from_video(video_path,save_dir):
 
 class MediaFrameHolder:
     def __init__(self, url: str) -> None:
-        if (url == "asserts/examples/base.mp4"):
+        if ("base.mp4" in url):
             self.audio_holder = FrameHolder('audio', url)
             self.video_holder = FrameHolder('video', url)
         else: 
@@ -355,6 +362,8 @@ async def on_message(ws, message):
     sdp = json_message["sdp"]
     type = json_message["type"]
     client_id = json_message["client_id"]
+    character = json_message["character"]
+    characterDict[client_id] = character
 
     conn_id = client_id
     offer = RTCSessionDescription(sdp=sdp, type=type)
@@ -367,7 +376,7 @@ async def on_message(ws, message):
     )
     pcs.add(pc)
 
-    player = SegmentPlayer(playlist=playlist)
+    player = SegmentPlayer(playlist=playlistDict[character])
     print("[###] user {} connected.".format(conn_id))
     players[conn_id] = player
 
@@ -422,21 +431,28 @@ if __name__ == '__main__':
 
     # load config
     opt = DINetInferenceOptions().parse_args()
-    if not os.path.exists(opt.source_video_path):
-        raise ('wrong video path : {}'.format(opt.source_video_path))
+    
     
     ############################################## extract frames from source video ##############################################
-    print('extracting frames from video: {}'.format(opt.source_video_path))
-    video_frame_dir = opt.source_video_path.replace('.mp4', '')
-    if not os.path.exists(video_frame_dir):
-        os.mkdir(video_frame_dir)
-    video_size = extract_frames_from_video(opt.source_video_path,video_frame_dir)
+    # if not os.path.exists(opt.source_video_path):
+    #     raise ('wrong video path : {}'.format(opt.source_video_path))
+    # print('extracting frames from video: {}'.format(opt.source_video_path))
+    # video_frame_dir = opt.source_video_path.replace('.mp4', '')
+    # if not os.path.exists(video_frame_dir):
+    #     os.mkdir(video_frame_dir)
+    # video_size = extract_frames_from_video(opt.source_video_path,video_frame_dir)
+    # print('video size: {}'.format(video_size))
+    video_size = (1080, 1920)
     
     ############################################## load facial landmark ##############################################
-    print('loading facial landmarks from : {}'.format(opt.source_openface_landmark_path))
-    if not os.path.exists(opt.source_openface_landmark_path):
-        raise ('wrong facial landmark path :{}'.format(opt.source_openface_landmark_path))
-    video_landmark_data = load_landmark_openface(opt.source_openface_landmark_path).astype(np.int)
+    # print('loading facial landmarks from : {}'.format(opt.source_openface_landmark_path))
+    # if not os.path.exists(opt.source_openface_landmark_path):
+    #     raise ('wrong facial landmark path :{}'.format(opt.source_openface_landmark_path))
+    # video_landmark_data = load_landmark_openface(opt.source_openface_landmark_path).astype(np.int)
+    landmarkDict["mm_1"] = load_landmark_openface('./asserts/examples/mm_1.csv').astype(np.int)
+    landmarkDict["mm_2"] = load_landmark_openface('./asserts/examples/mm_2.csv').astype(np.int)
+    
+    
 
     ############################################## load pretrained model weight ##############################################
     print('loading pretrained model from: {}'.format(opt.pretrained_clip_DINet_path))
@@ -455,10 +471,12 @@ if __name__ == '__main__':
         raise ('pls download pretrained model of deepspeech')
     DSModel = DeepSpeech(opt.deepspeech_model_path)
     DSModel.compute_audio_feature(opt.driving_audio_path)
-    ref_img_tensor = torch.load("five_selected_ref_img.pt")
+    # ref_img_tensor = torch.load("mm_2.pt")
+    refImgTensorDict["mm_2"] = torch.load("mm_2.pt")
+    refImgTensorDict["mm_1"] = torch.load("mm_1.pt")
 
     ############################################## 核心推理函数 ##############################################
-    def infer_process(wav_data, wav_file, mp4_file):
+    def infer_process(wav_data, wav_file, mp4_file, user_id):
         __start_time = time.time()
         # 获取当前的时间戳，按照毫秒
         time_stamp = time.time()
@@ -467,10 +485,11 @@ if __name__ == '__main__':
         ds_feature_padding = np.pad(ds_feature, ((2, 2), (0, 0)), mode='edge')
         
         ############################################## align frame with driving audio ##############################################
+        video_landmark_data = landmarkDict[characterDict[user_id]]
         print('aligning frames with driving audio')
         time_stamp = time.time()
 
-        video_frame_path_list = glob.glob(os.path.join(video_frame_dir, '*.jpg'))
+        video_frame_path_list = glob.glob(os.path.join('./asserts/examples/'+characterDict[user_id], '*.jpg'))
         if len(video_frame_path_list) != video_landmark_data.shape[0]:
             raise ('video frames are misaligned with detected landmarks')
         video_frame_path_list.sort()
@@ -497,9 +516,12 @@ if __name__ == '__main__':
         print('selecting five reference images')
         time_stamp = time.time()
         
-        # ref_img_list = []
+        
         resize_w = int(opt.mouth_region_size + opt.mouth_region_size // 4)
         resize_h = int((opt.mouth_region_size // 2) * 3 + opt.mouth_region_size // 8)
+
+        # 以下代码不再执行，直接保存 tensor 到本地，后面直接读取
+        # ref_img_list = []
         # ref_index_list = random.sample(range(5, len(res_video_frame_path_list_pad) - 2), 5)
         # for ref_index in ref_index_list:
         #     crop_flag,crop_radius = compute_crop_radius(video_size,res_video_landmark_data_pad[ref_index - 5:ref_index, :, :])
@@ -517,9 +539,9 @@ if __name__ == '__main__':
         #     ref_img_list.append(ref_img_crop)
         # ref_video_frame = np.concatenate(ref_img_list, 2)
         # ref_img_tensor = torch.from_numpy(ref_video_frame).permute(2, 0, 1).unsqueeze(0).float().cuda()
-        # torch.save(ref_img_tensor, "five_selected_ref_img.pt")
+        # torch.save(ref_img_tensor, "mm_1.pt")
 
-        print('随机选择5个图片的时间开销(秒):', time.time() - time_stamp)
+        # print('随机选择5个图片的时间开销(秒):', time.time() - time_stamp)
 
         ############################################## inference frame by frame ##############################################
         time_stamp = time.time()
@@ -557,7 +579,10 @@ if __name__ == '__main__':
             crop_frame_tensor = torch.from_numpy(crop_frame_data).float().cuda().permute(2, 0, 1).unsqueeze(0)
             deepspeech_tensor = torch.from_numpy(ds_feature_padding[clip_end_index - 5:clip_end_index, :]).permute(1, 0).unsqueeze(0).float().cuda()
             with torch.no_grad():
-                pre_frame = model(crop_frame_tensor, ref_img_tensor, deepspeech_tensor)
+                # pre_frame = model(crop_frame_tensor, ref_img_tensor, deepspeech_tensor)
+                # 根据 user_id 获取 选择的 chracter，然后根据 chracter 获取 refImgTensor
+                pre_frame = model(crop_frame_tensor, refImgTensorDict[characterDict[user_id]], deepspeech_tensor)
+
                 pre_frame = pre_frame.squeeze(0).permute(1, 2, 0).detach().cpu().numpy() * 255
             # videowriter_face.write(pre_frame[:, :, ::-1].copy().astype(np.uint8))
             pre_frame_resize = cv2.resize(pre_frame, (crop_frame_w,crop_frame_h))
@@ -635,7 +660,7 @@ if __name__ == '__main__':
             mp4_file = "/home/ubuntu/code/DINet/asserts/inference_result/{}{}{}.mp4".format(data['user_id'], FILE_NAME_SPLIT, file_count)
             jump_file = "/home/ubuntu/code/DINet/asserts/inference_result/{}{}{}".format(data['user_id'], FILE_NAME_SPLIT, file_count)
             save_wav(wav_file, data['rawdata'])
-            infer_process(data['rawdata'], wav_file, mp4_file) # 推理
+            infer_process(data['rawdata'], wav_file, mp4_file, data['user_id']) # 推理
 
             # 选择对的 player jump in 数据
             try:
