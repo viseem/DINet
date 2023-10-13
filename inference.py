@@ -49,7 +49,7 @@ channel = None
 # 音频处理设置信息
 data_queue = queue.Queue()
 URL= "wss://nls-gateway-cn-beijing.aliyuncs.com/ws/v1"
-TOKEN= "a98aabd17b124d3b8fcf09bebe3be98b"
+TOKEN= "4073dff214f84ff3859db63f8d7cc5a0"
 APPKEY="igPUfsogsueKTmi2"
 sample_rate = 16000
 bytes_per_sample = 2  # 16-bit PCM
@@ -69,6 +69,8 @@ playlistDict = {
 characterDict = {} # 链接 connec_id 与 character 的关系
 refImgTensorDict = {} # 链接 character 与 refImgTensor 的关系
 landmarkDict = {} # 链接 character 与 landmark 的关系
+frameOffsetDict = {} # connect_id 与 frame offset
+hasNewStream = {}
 
 ############################################## webrtc start ##############################################
 
@@ -364,6 +366,8 @@ async def on_message(ws, message):
     client_id = json_message["client_id"]
     character = json_message["character"]
     characterDict[client_id] = character
+    frameOffsetDict[client_id] = 0 # 视频偏移重置为 0
+    hasNewStream[client_id] = False
 
     conn_id = client_id
     offer = RTCSessionDescription(sdp=sdp, type=type)
@@ -496,14 +500,40 @@ if __name__ == '__main__':
         video_frame_path_list_cycle = video_frame_path_list + video_frame_path_list[::-1]
         video_landmark_data_cycle = np.concatenate([video_landmark_data, np.flip(video_landmark_data, 0)], 0)
         video_frame_path_list_cycle_length = len(video_frame_path_list_cycle)
-        if video_frame_path_list_cycle_length >= res_frame_length:
-            res_video_frame_path_list = video_frame_path_list_cycle[:res_frame_length]
-            res_video_landmark_data = video_landmark_data_cycle[:res_frame_length, :, :]
+
+        # 获取当前的帧偏移
+        frame_offset = frameOffsetDict[user_id] if frameOffsetDict[user_id] is not None else 0
+
+        print(f"读取第 {frame_offset} - {frame_offset + res_frame_length} 帧, 一共：{video_frame_path_list_cycle_length}帧")
+        
+        if frame_offset % video_frame_path_list_cycle_length > (frame_offset + res_frame_length - 1) % video_frame_path_list_cycle_length:
+            frame_offset = frame_offset % video_frame_path_list_cycle_length
+            end = (frame_offset + res_frame_length) % video_frame_path_list_cycle_length
+            res_video_frame_path_list = video_frame_path_list_cycle[frame_offset:] + video_frame_path_list_cycle[:end]
+            
+            try:
+                res_video_landmark_data = np.concatenate([video_landmark_data_cycle[frame_offset:, :, :] + video_landmark_data_cycle[:end, :, :]], 0)
+            finally:
+                pass
+            
         else:
-            divisor = res_frame_length // video_frame_path_list_cycle_length
-            remainder = res_frame_length % video_frame_path_list_cycle_length
-            res_video_frame_path_list = video_frame_path_list_cycle * divisor + video_frame_path_list_cycle[:remainder]
-            res_video_landmark_data = np.concatenate([video_landmark_data_cycle]* divisor + [video_landmark_data_cycle[:remainder, :, :]],0)
+            frame_offset = frame_offset % video_frame_path_list_cycle_length
+            res_video_frame_path_list = video_frame_path_list_cycle[frame_offset: frame_offset + res_frame_length]
+            res_video_landmark_data = video_landmark_data_cycle[frame_offset: frame_offset + res_frame_length, :, :]
+
+        # 更新偏移
+        frameOffsetDict[user_id] = frameOffsetDict[user_id] + res_frame_length
+
+        # if video_frame_path_list_cycle_length >= res_frame_length:
+        #     res_video_frame_path_list = video_frame_path_list_cycle[:res_frame_length]
+        #     res_video_landmark_data = video_landmark_data_cycle[:res_frame_length, :, :]
+        # else:
+        #     divisor = res_frame_length // video_frame_path_list_cycle_length
+        #     remainder = res_frame_length % video_frame_path_list_cycle_length
+        #     res_video_frame_path_list = video_frame_path_list_cycle * divisor + video_frame_path_list_cycle[:remainder]
+        #     res_video_landmark_data = np.concatenate([video_landmark_data_cycle]* divisor + [video_landmark_data_cycle[:remainder, :, :]],0)
+        
+        
         res_video_frame_path_list_pad = [video_frame_path_list_cycle[0]] * 2 \
                                         + res_video_frame_path_list \
                                         + [video_frame_path_list_cycle[-1]] * 2 
@@ -638,6 +668,10 @@ if __name__ == '__main__':
     def tts_on_completed(message, *args):
         user_id = args[0]
         global data_buffer
+        global hasNewStream
+
+        hasNewStream[user_id] = True
+
         if len(data_buffer) > 0:
             data_queue.put({'rawdata': data_buffer[:sample_rate], 'user_id': user_id})  # put any remaining data in the queue
             data_buffer = data_buffer[sample_rate:]
@@ -645,6 +679,13 @@ if __name__ == '__main__':
     def tts_on_data(data, *args):
         user_id = args[0]
         global data_buffer
+        global hasNewStream
+
+        if hasNewStream[user_id] is True:
+            # 新的对话置为 0
+            frameOffsetDict[user_id] = 0
+            hasNewStream[user_id] = False
+
         current_data = np.frombuffer(data, dtype=np.int16)
         data_buffer = np.concatenate((data_buffer, current_data))
         
