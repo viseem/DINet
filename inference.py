@@ -446,7 +446,7 @@ if __name__ == '__main__':
     #     os.mkdir(video_frame_dir)
     # video_size = extract_frames_from_video(opt.source_video_path,video_frame_dir)
     # print('video size: {}'.format(video_size))
-    video_size = (1080, 1920)
+    video_size = (720, 1280)
     
     ############################################## load facial landmark ##############################################
     # print('loading facial landmarks from : {}'.format(opt.source_openface_landmark_path))

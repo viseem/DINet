@@ -82,7 +82,8 @@ if __name__ == '__main__':
     resize_w = int(opt.mouth_region_size + opt.mouth_region_size // 4)
     resize_h = int((opt.mouth_region_size // 2) * 3 + opt.mouth_region_size // 8)
     ref_index_list = random.sample(range(5, len(res_video_frame_path_list_pad) - 2), 5)
-    for ref_index in ref_index_list:
+    print(ref_index_list)
+    for ref_index in [10, 20, 30, 40, 50]:
         crop_flag,crop_radius = compute_crop_radius(video_size,res_video_landmark_data_pad[ref_index - 5:ref_index, :, :])
         if not crop_flag:
             raise ('our method can not handle videos with large change of facial size!!')
